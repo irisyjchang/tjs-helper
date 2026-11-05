@@ -1,6 +1,6 @@
 # Order Writer Review and Shift Handoff Assistant
 
-**Design document · Draft v3 · November 4, 2026**
+**Design document · Draft v4 · November 4, 2026**
 
 ## 1. Problem and intended users
 
@@ -42,7 +42,7 @@ This is a design rationale based on the official transcript, not company endorse
 
 The first version supports:
 
-1. A section-wide nightly ordering worksheet with recent unit sales, trends, stock counts, incoming cases and dates, proposed quantities, and data freshness; routine review does not require opening each product.
+1. A section-wide nightly ordering worksheet with recent unit sales, trends, separate shelf/backstock counts, facings, shelf/display capacity, incoming cases and dates, proposed quantities, and data freshness; routine review does not require opening each product.
 2. Draft orders visible to both writers, attributed to their creator.
 3. An explainable review of tonight's proposed quantities against recent trends, arrival dates, pending quantities, and configured stock targets. Prioritize projected shortages and excess coverage, rather than flagging consecutive nightly orders by themselves.
 4. Recording an externally placed order as pending delivery.
@@ -116,15 +116,30 @@ The dataset does **not** establish unit sales, stock levels, case packs, wholesa
 
 Select an initial 20–30 snack products after checking coverage and names. Snack classification may require manual review. Store SKUs as strings to preserve leading zeros. Preserve raw rows and timestamps; report invalid rows and duplicates. An import key based on snapshot identity and chunk number prevents repeated events from duplicating work.
 
-For each pilot product, enter clearly marked synthetic settings: units per case, initial units, average daily demand, delivery lead time, safety stock, review interval, and optional capacity. Use observed retail price only for a labeled retail-value approximation. It is not acquisition cost, profit, or a current store price.
+For each pilot product, enter clearly marked synthetic settings: units per case, facings, units per facing, confirmed shelf capacity, any additional display capacity, optional allocated backstock capacity, initial shelf/backstock units, average daily demand, delivery lead time, safety stock, and review interval. The public dataset does not supply these operational settings. Use observed retail price only for a labeled retail-value approximation. It is not acquisition cost, profit, or a current store price.
 
 ## 6. Core quantities and recommendation rule
 
 **Use individual sellable units internally.** Writers order in cases; the system converts cases to units using a versioned case-pack value. Receiving uses actual units received. Never add cases and units directly.
 
+### Shelf layout, capacity, and physical counts
+
+For each product location, record facing count, units deep per facing, and stacking levels where applicable. A simple capacity estimate is `facings × units deep × stacking levels`. Alternatively enter units per facing, already including stacking, and calculate `facings × units per facing`; never multiply the stacking factor twice. Irregular packaging can make this estimate inaccurate, so retain a separately confirmed sellable-unit capacity with recorder, date, and method. Exact shelf dimensions are optional when capacity can be counted directly.
+
+Track primary shelf and additional display locations separately, each with an ID and non-overlapping capacity. An extra display adds capacity only while active; moving a facing from one location to another must not double-count it. Total active selling capacity is the sum of confirmed active location capacities. Optional allocated backstock capacity is separate from selling capacity; it does not model shared backroom space across all products.
+
+Record physical shelf/display counts and backstock counts independently, with observation timestamps and sources. Compute total on-hand only when all required counts are known and sufficiently current. Unknown is not zero. A shelf gap with backstock calls for replenishment, not automatically another supplier order.
+
+Store layout and case-pack changes as effective-dated revisions. The active layout drives current projections; historical snapshots explain older decisions. Preserve the case-pack value on each order line so a later pack-size change does not alter the units already ordered. Show recent facing/display changes next to sales comparisons without claiming they caused the change.
+
+**Capacity example:** three facings holding six bags each give an estimated shelf capacity of 18 units. With 12 units per case, one case fits on an empty shelf and a second case leaves six units needing another location or backstock. This physical calculation alone does not establish the right order quantity.
+
+### Demand and arrival projections
+
 For a product:
 
 ```text
+on-hand units = shelf/display units + backstock units
 inventory position = on-hand units + outstanding ordered units
 target units = ceil(average daily demand × (lead-time days + review-interval days)
                     + safety-stock units)
@@ -136,6 +151,8 @@ This is a transparent starting rule, not a validated forecasting model. The oper
 
 Use a daily projection as the decision check: start with on-hand units, add confirmed pending units on their expected arrival dates, and subtract estimated daily demand. Project through the next delivery plus review interval. Show shortages before a new order can arrive separately from quantities a new order can address. Never suppress a near-term shortage just because a later delivery makes the overall inventory position look sufficient. Round-to-case effects and capacity warnings remain visible. Writers can override a recommendation with a reason; the system records the reason and the state used for the decision.
 
+Evaluate space at each arrival using projected remaining stock, other incoming orders, active selling capacity, and any known allocated backstock capacity. Shelf capacity is not an order cap: more than one shelf-fill may be appropriate when sales and restocking justify it. Show expected backstock and storage overflow separately from demand coverage. If backstock capacity is unknown, report that storage fit cannot be verified. If physical counts or layout capacity are missing/stale, show historical context but withhold confident quantity/fit claims; any writer-entered estimate is clearly labeled.
+
 **Example:** a writer returning after five days sees, directly on the worksheet, that an item's recent daily sales rose, four cases are due tomorrow, and the coworker noted increased weekend demand. Adding three more cases immediately updates projected coverage and explains any excess. The writer can revise the quantity or retain it with a reason. Specific example quantities are illustrative, not demand inferred from the public dataset.
 
 ## 7. User workflow and order lifecycle
@@ -143,6 +160,8 @@ Use a daily projection as the decision check: start with on-hand units, add conf
 At shift start, default to the period since the writer's last recorded worked shift, with an adjustable date range. Do not infer worked shifts from page views. Acknowledge events independently: seeing a note is not the same as working a shift or agreeing with its content.
 
 The worksheet summarizes recent and preceding equal-length periods of observed unit sales, days stocked out, orders by writer, receipts, overdue deliveries, stock-count age, and relevant notes. Show absolute changes; omit percentage changes with a zero baseline. Label comparisons with unequal weekday mixes and limited history rather than presenting them as proven demand shifts. A zero-sales stockout day is not evidence of zero demand.
+
+Keep facings, confirmed selling capacity, separate shelf/backstock units, and case size visible inline. Distinguish "refill shelf from backstock," "review supplier quantity," and "count/layout information needed." Layout maintenance is a small dated update, not another nightly requirement to reenter every product's dimensions.
 
 Prioritize products needing attention, while keeping all products searchable. Inline details explain warnings, for example: "Three additional cases would take projected stock above your configured target; four cases are already due tomorrow." Trend summaries and alerts use explicit calculations and templates in the MVP; an LLM is unnecessary.
 
@@ -160,6 +179,8 @@ DRAFT → ORDERED → PARTIALLY_RECEIVED → RECEIVED
 Use one SKU per order line in the MVP. A multi-product order is a batch of independently recorded lines, each with its own result; do not promise all-or-nothing confirmation of an unlimited basket.
 
 Writers may revise drafts. Once ordered, changing a quantity requires an auditable amendment. A request to cancel a real external order leaves its units pending until cancellation is confirmed externally. Receipt commands identify the order line and delivery, increment on-hand, and decrement pending quantities atomically. Received units cannot be cancelled retroactively. Returned/damaged stock uses a separate adjustment with a reason.
+
+Record where received units were placed; the demo defaults receipts to backstock. A shelf-replenishment command transfers units from backstock to a selling location atomically, preserving total on-hand and requiring enough source units. Block transfers beyond confirmed location capacity unless the user records a corrected layout or an explicit overflow location. Supplier receipts are real facts: record over-capacity arrivals and flag overflow rather than dropping received units to make the capacity constraint appear satisfied.
 
 ## 8. Concurrent updates and accurate external-order records
 
@@ -191,8 +212,10 @@ Every mutation includes a caller-generated idempotency key, payload hash, and au
 
 Include environment/scenario and store scope in every partition key so simulation cannot modify live pilot records.
 
-- Inventory: `PK = SCOPE#<scope>#STORE#<id>#SECTION#<section>`, `SK = SKU#<sku>`. Current units, outstanding units, revision, last physical count, case pack, and demand/target settings.
-- Order line: `PK = SCOPE#<scope>#STORE#<id>#ORDER#<orderId>`, `SK = LINE#<lineId>`. SKU, ordered/received/cancelled units, creator, expected arrival, status, and revision.
+- Inventory: `PK = SCOPE#<scope>#STORE#<id>#SECTION#<section>`, `SK = SKU#<sku>`. Separate selling-location and backstock unit observations with timestamps, derived on-hand when valid, outstanding units, revision, active layout/case-pack revision, and demand/target settings. Bound the number of locations for the pilot; unit transfers update the SKU state atomically.
+- Layout revision: same section partition, `SK = LAYOUT#<sku>#<effectiveAt>#<revisionId>`. Location IDs, active periods, facings, units per facing or depth/stacking inputs, estimated/confirmed capacities and method, optional allocated backstock capacity, recorder, and reason. Preserve the active-layout pointer and reject ambiguous overlapping effective periods.
+- Case-pack revision: same section partition, `SK = PACK#<sku>#<effectiveAt>#<revisionId>`. Units per case, recorder, source, and effective date; keep all pilot values labeled synthetic.
+- Order line: `PK = SCOPE#<scope>#STORE#<id>#ORDER#<orderId>`, `SK = LINE#<lineId>`. SKU, cases ordered, case-pack snapshot, ordered/received/cancelled units, creator, expected arrival, status, and revision.
 - Activity: section partition, `SK = EVENT#<timestamp>#<eventId>`. Action, actor, SKU, quantity delta, order reference, reason, and before/after revisions.
 - Handoff note: section partition, `SK = NOTE#<timestamp>#<noteId>`. Author, related SKU, message, status, and acknowledgement history.
 - Daily product observation: section partition, `SK = DAY#<date>#SKU#<sku>`. Observed fulfilled sales, stockout flag, source, and observation completeness, used for section-wide trend queries. Simulation-only latent demand is stored outside this operational view.
@@ -215,6 +238,8 @@ S3 retains raw dataset snapshots, validation reports, complete scenario inputs, 
 - `POST /order-lines/{id}/receipts`: receive actual units against a pending order.
 - `POST /order-lines/{id}/cancel-remainder`: cancel an unreceived quantity.
 - `POST /inventory/{sku}/adjustments`: count corrections or damage, with reason and revision.
+- `POST /inventory/{sku}/replenishments`: transfer backstock units to a specified shelf/display location with expected revision and idempotency key.
+- `POST /inventory/{sku}/layout-revisions`: record effective-dated facings, capacities, and display changes; restricted to the configured section-maintenance role.
 - `POST /sections/{id}/notes`: add a handoff note.
 - `POST /simulation-runs`: create an isolated, versioned scenario; operator-only.
 
@@ -233,7 +258,7 @@ unmet demand = latent demand − fulfilled sales
 
 Low recorded sales during a stockout must not be interpreted as low customer demand. The simulator has access to latent demand for evaluation; order writers and policies do not see future demand.
 
-Start with daily ticks: receive deliveries due at the start of the day, apply that day's demand, then run that night's writer review. Someone reviews orders every night. Configure repeating blocks of consecutive shifts, including a five-day block followed by a three-day block as an illustrative scenario. Document this order because it affects outcomes. Daily resolution does not test simultaneous updates; use separate concurrent API tests for that case.
+Start with daily ticks: receive deliveries due at the start of the day into backstock, replenish selling locations, apply that day's demand, then run that night's writer review. The initial daily model assumes prompt within-day replenishment while backstock remains and active selling capacity is positive; it can therefore fulfill demand from total on-hand. Record transfers and preserve capacity/count invariants. With zero selling capacity, fulfill no sales until a location is configured. This model does not evaluate labor-driven shelf gaps or restocking delays; test limited replenishment in a later scenario before making claims about shelf availability. Someone reviews orders every night. Configure repeating blocks of consecutive shifts, including a five-day block followed by a three-day block as an illustrative scenario. Document this order because it affects outcomes. Daily resolution does not test simultaneous updates; use separate concurrent API tests for that case.
 
 Pre-generate an immutable demand trace per product/day and a documented delivery environment. A fixed seed, stable product ordering, pinned random-generator version, and separate random streams for demand, disruptions, and writer behavior make experiments reproducible. A seed alone is insufficient if code changes the order of random calls.
 
@@ -257,6 +282,7 @@ Measure operational outcomes together so reducing stockouts by ordering unlimite
 - **Fill rate:** total fulfilled units / total latent demand; omit or mark undefined when demand is zero.
 - **Stockout product-days:** product-days with unmet demand.
 - **Excess units:** units above the configured capacity or target, with the selected definition reported.
+- **Storage overflow:** units above active selling capacity plus known allocated backstock capacity, evaluated at arrivals; omit the metric where backstock capacity is unknown. This differs from units above a demand-based target.
 - **Average on-hand:** mean daily units per product and across the section.
 - **Over-target proposals:** proposed quantities that would exceed a configured stock/coverage target; report context and overrides. Consecutive nightly orders are not counted as errors by themselves.
 - **Handoff usefulness:** time and accuracy when returning writers identify trends, pending quantities, and recent changes across the section without opening every product history.
@@ -264,6 +290,8 @@ Measure operational outcomes together so reducing stockouts by ordering unlimite
 Do not report waste reduction without an expiry model, or profit savings without real acquisition costs. Simulated success demonstrates behavior under assumptions, not proven business impact.
 
 Required checks: simultaneous order writes, durable recording of an already-placed external order after contention, duplicate request retry, partial receipt followed by confirmed cancellation, stale stock count, failed tick replay, cross-store access rejection, units/case conversion, pending-total reconciliation, incomplete trend data, zero baselines, and summaries spanning consecutive shift blocks. The low-level concurrency test must show only one write commits against a shared revision; retry handling must preserve all actual external-order facts.
+
+Capacity checks: three facings × six units yields 18 units; unknown backstock does not become zero; shelf replenishment preserves total units and never exceeds source stock; active displays are counted once; historical orders retain their case-pack snapshot; dated layout changes alter fit warnings without rewriting past decisions; over-capacity receipts remain recorded; and a shelf gap with available backstock produces a replenishment suggestion rather than automatically increasing an order.
 
 ## 13. Reliability, cost, and limitations
 
@@ -279,7 +307,7 @@ The main product risk is whether the summary is accurate, fast, and useful enoug
 
 1. **Overlap with existing reports:** compare the prototype with the best existing section-wide workflow available at the user's store, not only a deliberately inconvenient item-by-item interface. If an existing report already solves the task, focus on the remaining handoff context or reconsider the feature.
 2. **Data access and extra work:** the public catalog cannot power actual demand summaries. Test with synthetic batches first. Any future internal-data connection needs an authorized path; copying the same facts into a second app could erase the time savings.
-3. **Freshness and physical stock:** shelf gaps may coexist with backstock, missing deliveries, or incorrect counts. Show provenance, shelf/backstock distinctions when recorded, and uncertainty. Avoid precise coverage claims when stock observations are unreliable.
+3. **Freshness and physical stock:** shelf gaps may coexist with backstock, missing deliveries, or incorrect counts. Maintain separate shelf/backstock observations and dated layout capacities; expose missing values and uncertainty. Validate how often writers can realistically maintain these inputs. Avoid precise coverage claims when stock observations are unreliable.
 4. **Misleading trend comparisons:** different weekday mixes, stockouts, short history, displays, and warehouse restrictions can change observed sales. Show comparison periods and contextual flags; do not automatically label every change a demand trend.
 5. **Alert fatigue:** ordinary nightly replenishment is not an error. Test configurable thresholds and exception priorities, keep the full section accessible, and measure unnecessary warnings as well as missed issues.
 6. **Validation and scope:** an experiment can demonstrate performance under synthetic assumptions, but only writer testing can establish usability. Keep the first milestone centered on review and handoff, with no automated supplier actions or employee performance judgments.
@@ -293,6 +321,6 @@ The main product risk is whether the summary is accurate, fast, and useful enoug
 5. Refine usability with order writers, including warning usefulness and local judgment. Assess whether the time savings justify the data-entry/import effort.
 6. Consider operational mutation routes, forecasting, or authorized integrations only after the handoff workflow works.
 
-Open decisions: actual store timezone; writer versus lead permissions; case-pack assumptions; review/delivery cadence; capacity and safety-stock settings; which sandbox services are allowed; and whether the pilot needs external-order references.
+Open decisions: actual store timezone; writer versus lead permissions; synthetic case-pack and facing settings; count freshness thresholds; who maintains shelf/display changes; review/delivery cadence; allocated backstock capacity and safety-stock settings; which sandbox services are allowed; and whether the pilot needs external-order references.
 
 **Before proceeding:** review this proposed stack and the serverless modular-monolith architecture with event-driven background jobs. Nothing in this document places a real supplier order, provisions AWS resources, or claims access to Trader Joe's internal systems.
