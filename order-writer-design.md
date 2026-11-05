@@ -1,0 +1,244 @@
+# Shared Ordering and Shift Handoff
+
+**Design document · Draft v1 · November 4, 2026**
+
+## 1. Problem and intended users
+
+Two order writers cover the same grocery section on different days. Each may know their own orders but lack a timely view of the other person's actions. Both may order against the same apparent shortage, creating excess inventory; each may assume the other has ordered, creating a stockout.
+
+The primary user is a grocery-section order writer, initially working with snacks. A section lead is a secondary user who maintains product settings and reviews exceptions. The first pilot covers one simulated store, one section, and two writers.
+
+**Product objective:** before ordering, show what is on hand, what is coming, what coworkers are planning, and what changed since the writer's last shift.
+
+This is an independent portfolio prototype using public product data and synthetic operations. It is not an official Trader Joe's system and has no supplier or point-of-sale integration.
+
+## 2. MVP and boundaries
+
+The first version supports:
+
+1. A shared product list with stock counts, pending deliveries, drafts, and stock-count freshness.
+2. Draft orders visible to both writers, attributed to their creator.
+3. Review of a proposed order against existing pending quantities and stock targets.
+4. Recording an externally placed order as pending delivery.
+5. Partial receiving, cancellation of unreceived quantities, and inventory adjustments.
+6. Shift notes and a timestamped activity feed.
+7. A simulation that exercises demand, deliveries, and alternating writer shifts.
+
+Deferred: real supplier submission, live store inventory, automatic purchasing, machine-learning forecasting, expiry/lot tracking, multiple warehouses, and native mobile apps. A simple browser interface is sufficient for the pilot; detailed visual design comes later.
+
+The system cannot prevent a purchase made outside it. Writers must record external orders promptly. Its benefit depends on timely stock counts and order recording; the interface must make stale information visible.
+
+## 3. Architecture style
+
+**A serverless modular monolith with an event-driven background pipeline.**
+
+The backend is one codebase divided into catalog, inventory, orders, handoffs, and simulation modules. A small number of Lambda functions expose these modules or run background work. This avoids the coordination overhead of independently deployed microservices for a small application.
+
+User commands use synchronous API requests and DynamoDB transactions. Background events handle dataset imports and simulation steps. Critical stock and pending-order totals are updated in the command transaction, not by a later notification that might arrive out of order.
+
+An append-only activity ledger accompanies current-state records. This is **not full event sourcing**: DynamoDB current-state records are authoritative for operations, while ledger entries explain changes and support review.
+
+```mermaid
+flowchart TD
+    U[Order writer / section lead] --> UI[React + TypeScript browser app]
+    UI --> AUTH[Cognito sign-in]
+    UI --> API[API Gateway HTTP API]
+    API --> L[Lambda: application API]
+    L --> DB[DynamoDB: current state + activity ledger]
+
+    RAW[S3: public dataset snapshot] --> IMP[Lambda: validate and import]
+    IMP --> CAT[DynamoDB: product catalog]
+    CAT --> L
+
+    SCH[EventBridge Scheduler or manual run] --> SIM[Lambda: simulation worker]
+    SIM --> DB
+    SIM --> OUT[S3: scenario inputs + experiment results]
+    SIM --> DLQ[SQS: failed scheduled invocations]
+
+    L --> LOG[CloudWatch logs + metrics]
+    IMP --> LOG
+    SIM --> LOG
+```
+
+## 4. Proposed stack
+
+- **Frontend:** React, TypeScript, Vite; responsive browser UI. Proposed hosting is AWS Amplify Hosting, subject to sandbox availability. Local hosting is sufficient while building the backend.
+- **API:** API Gateway HTTP API, with Cognito JWT authentication.
+- **Backend:** Python Lambda functions using boto3; domain logic shared by the API and simulator.
+- **Database:** DynamoDB on-demand tables for catalog and operations.
+- **Files:** private S3 buckets for source snapshots, scenario configurations, and result exports. Product images are not required.
+- **Scheduling:** EventBridge Scheduler, optionally invoking a simulation worker at a modest interval. Accelerated experiments can run manually without waiting for wall-clock days.
+- **Failure capture:** an SQS dead-letter queue for Scheduler delivery failures; configure asynchronous Lambda failure handling separately, since a delivered invocation can still fail during execution.
+- **Operations:** CloudWatch, scoped IAM roles, and AWS Budgets where the sandbox permits them.
+- **Infrastructure:** AWS SAM/CloudFormation for repeatable backend deployment. Pin application dependencies and keep configuration in version control.
+- **Verification:** pytest for domain rules and simulator reproducibility; a small set of API/integration tests and browser checks for the two-writer workflow.
+
+Before provisioning, verify the sandbox's allowed services, IAM restrictions, region, credit expiration, and billing visibility. This document does not record a deployment.
+
+## 5. Data source and what must be simulated
+
+Use the public [cmoog/traderjoes project](https://github.com/cmoog/traderjoes) and its [price-history CSV](https://data.traderjoesprices.com/dump.csv). Its documented schema includes SKU, product title, retail price, observation timestamp, store code, and availability. The project says its prices are sourced from Chicago South Loop, store 701. The repository has an MIT license; preserve its license and provenance, and review reuse conditions before publishing the dataset.
+
+The repository's age does not establish the latest observation date. Inspect the actual snapshot before making freshness claims. The full CSV is about 180 MB according to its download response; store it in S3 and stream it in bounded chunks rather than assuming every import is a tiny file.
+
+The dataset does **not** establish unit sales, stock levels, case packs, wholesale costs, supplier lead times, delivery reliability, shelf capacity, or current physical stock. Do not interpret its availability flag as measured store inventory.
+
+Select an initial 20–30 snack products after checking coverage and names. Snack classification may require manual review. Store SKUs as strings to preserve leading zeros. Preserve raw rows and timestamps; report invalid rows and duplicates. An import key based on snapshot identity and chunk number prevents repeated events from duplicating work.
+
+For each pilot product, enter clearly marked synthetic settings: units per case, initial units, average daily demand, delivery lead time, safety stock, review interval, and optional capacity. Use observed retail price only for a labeled retail-value approximation. It is not acquisition cost, profit, or a current store price.
+
+## 6. Core quantities and recommendation rule
+
+**Use individual sellable units internally.** Writers order in cases; the system converts cases to units using a versioned case-pack value. Receiving uses actual units received. Never add cases and units directly.
+
+For a product:
+
+```text
+inventory position = on-hand units + outstanding ordered units
+target units = ceil(average daily demand × (lead-time days + review-interval days)
+                    + safety-stock units)
+suggested units = max(0, target units − inventory position)
+suggested cases = ceil(suggested units / units per case)
+```
+
+This is a transparent starting rule, not a demand forecast. Synthetic demand parameters power the demo; a real deployment would need validated sales history or writer-entered estimates. Open drafts are displayed as intentions and are not counted as confirmed incoming stock. Otherwise an abandoned draft could suppress a necessary order.
+
+Show expected delivery dates and projected stock by day. A late delivery does not solve an earlier shortage even if the overall inventory position looks sufficient. Round-to-case effects and capacity warnings remain visible. Writers can override a recommendation with a reason; the system records the reason and the state used for the decision.
+
+**Example:** 10 units on hand, 24 incoming, target 40, and 12 units per case yields a suggestion of one case. The writer sees that the case rounding produces 46 projected units. If a coworker records another case before confirmation, the original request becomes stale and must be reviewed again.
+
+## 7. User workflow and order lifecycle
+
+At shift start, show changes since the writer's last acknowledged activity cursor: orders recorded, receipts, shortages, stock adjustments, and open notes. Reading a feed and acknowledging it are separate actions. An acknowledgement means seen, not agreement with its content.
+
+Per-line order states:
+
+```text
+DRAFT → ORDERED → PARTIALLY_RECEIVED → RECEIVED
+  └→ CANCELLED          └→ close remainder as CANCELLED
+```
+
+`ORDERED` means the writer records an order already placed outside the application. It does not imply supplier acknowledgement. The demo simulator plays the supplier role. A real integration would need additional submitted/acknowledged/rejected states.
+
+Use one SKU per order line in the MVP. A multi-product order is a batch of independently recorded lines, each with its own result; do not promise all-or-nothing confirmation of an unlimited basket.
+
+Writers may revise drafts. Once ordered, changing a quantity requires an auditable amendment or cancellation of the unreceived remainder. Receipt commands identify the order line and delivery, increment on-hand, and decrement pending quantities atomically. Received units cannot be cancelled retroactively. Returned/damaged stock uses a separate adjustment with a reason.
+
+## 8. Preventing overlapping orders and inconsistent stock
+
+Visibility alone is insufficient: two people can read the same screen simultaneously. Each store/SKU state record therefore carries a revision number.
+
+When a writer records an order, the API uses a DynamoDB transaction to:
+
+1. Require that the submitted revision matches current store/SKU state.
+2. Create or transition the order line with the expected prior state.
+3. Increment outstanding units and advance the store/SKU revision.
+4. Add an immutable activity record.
+5. Save a durable idempotency record for the request.
+
+Two simultaneous confirmations against the same revision cannot both succeed. The losing request receives `409 Conflict` with instructions to reload and review the updated quantities. An acknowledged over-target order must still pass the revision check. An override is a business decision, not a way around concurrency controls.
+
+Use the same pattern for receipts, simulated sales, cancellations, and adjustments. Reject negative on-hand values and receipts exceeding the outstanding quantity. A new physical stock count is an absolute observation with a timestamp and expected revision; it must not silently overwrite a sale that arrived after the writer loaded the page.
+
+Use strongly consistent reads of authoritative base-table records for confirmation and current stock. Secondary indexes may support browsing; they must not decide whether a stock-changing command is valid. AWS documents [concurrent-update controls](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BestPractices_ImplementingVersionControl.html) and [transactional writes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transactions.html).
+
+Every mutation includes a caller-generated idempotency key, payload hash, and authenticated user identity. Identical retries return the original result; reuse with different contents fails. This handles a successful write followed by a lost network response as well as duplicate background invocations.
+
+## 9. Data model and access patterns
+
+### Catalog table
+
+`PK = PRODUCT#<sku>`, `SK = META`. Store name, source product ID, source snapshot, last observed retail price/date, source store, and classification provenance. Historical price observations use separate dated records if the application needs them; importing every historical observation into the operational database is unnecessary for this MVP.
+
+### Operations table
+
+Include environment/scenario and store scope in every partition key so simulation cannot modify live pilot records.
+
+- Inventory: `PK = SCOPE#<scope>#STORE#<id>#SECTION#<section>`, `SK = SKU#<sku>`. Current units, outstanding units, revision, last physical count, case pack, and demand/target settings.
+- Order line: `PK = SCOPE#<scope>#STORE#<id>#ORDER#<orderId>`, `SK = LINE#<lineId>`. SKU, ordered/received/cancelled units, creator, expected arrival, status, and revision.
+- Activity: section partition, `SK = EVENT#<timestamp>#<eventId>`. Action, actor, SKU, quantity delta, order reference, reason, and before/after revisions.
+- Handoff note: section partition, `SK = NOTE#<timestamp>#<noteId>`. Author, related SKU, message, status, and acknowledgement history.
+- Request result: scoped request partition, storing payload hash and committed outcome.
+- Simulation run/tick markers: run scope, storing scenario version, seed, completion state, and per-step progress.
+
+Use a secondary index for open order lines by scope/store/SKU and expected date. Query the base section partition to list inventory, query the activity prefix for handoffs, and query an order partition for its lines. Add a separate section-status index only when a measured access pattern requires it. Avoid operational table scans.
+
+S3 retains raw dataset snapshots, validation reports, complete scenario inputs, exogenous demand traces, and simulation exports. DynamoDB retains the small working state and audit references. Periodically reconcile outstanding totals against open order lines; flag discrepancies rather than silently rewriting totals during a user's command.
+
+## 10. API outline
+
+- `GET /sections/{id}/inventory`: current stock, pending units, count freshness, revisions.
+- `GET /sections/{id}/activity?cursor=...`: paginated shift history.
+- `POST /order-lines`: create a draft.
+- `POST /order-lines/{id}/record-order`: record an external purchase with expected revisions and idempotency key.
+- `POST /order-lines/{id}/receipts`: receive actual units against a pending order.
+- `POST /order-lines/{id}/cancel-remainder`: cancel an unreceived quantity.
+- `POST /inventory/{sku}/adjustments`: count corrections or damage, with reason and revision.
+- `POST /sections/{id}/notes`: add a handoff note.
+- `POST /simulation-runs`: create an isolated, versioned scenario; operator-only.
+
+Authenticate using Cognito; validate tokens at API Gateway and check store/section membership in the backend on every request. A user-provided store ID is not authorization. Scope idempotency records and file access the same way. See [API Gateway JWT authorizers](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html).
+
+## 11. Sales and shift simulation
+
+Generate latent demand, not merely recorded sales. Begin with daily Poisson demand per product, adjusted by configured weekday factors and optional demand spikes. More variable demand distributions can be a later experiment. All inputs are synthetic assumptions and remain visible in the scenario configuration.
+
+```text
+fulfilled sales = min(latent demand, available on-hand)
+unmet demand = latent demand − fulfilled sales
+```
+
+Low recorded sales during a stockout must not be interpreted as low customer demand. The simulator has access to latent demand for evaluation; order writers and policies do not see future demand.
+
+Start with daily ticks: receive deliveries due at the start of the day, apply that day's demand, then run the scheduled writer's review. Document this order because it affects outcomes. Daily resolution does not test simultaneous shifts; use separate concurrent API tests for that case.
+
+Pre-generate an immutable demand trace per product/day and a documented delivery environment. A fixed seed, stable product ordering, pinned random-generator version, and separate random streams for demand, disruptions, and writer behavior make experiments reproducible. A seed alone is insufficient if code changes the order of random calls.
+
+Compare two explicit policies:
+
+- **Limited-visibility baseline:** writers share physical stock observations but see only their own pending orders and notes when deciding quantities.
+- **Shared-tool policy:** writers see all pending orders and handoffs and use the same target rule.
+
+Both policies use the same initial stock, product settings, demand trace, review schedule, and delivery assumptions. Each scenario has separate operational state. This isolates the proposed visibility benefit while acknowledging that it is a modeled baseline, not a claim about every store's behavior.
+
+Evaluate at least 30 seeds over a proposed 60-day horizon, with low/high demand and reliable/delayed delivery scenarios. Report distributions and paired differences, including runs where the tool performs worse.
+
+A simulation tick must be restartable. Use a conditional run lease and deterministic run/day/SKU/action IDs; record product-step completion so retrying after a partial failure cannot repeat sales or deliveries. Cap invocation work and resume from a cursor. Do not depend on one long-running invocation for the whole experiment. AWS supports [scheduled Lambda invocation through EventBridge Scheduler](https://docs.aws.amazon.com/lambda/latest/dg/with-eventbridge-scheduler.html).
+
+## 12. Success measures and verification
+
+Measure operational outcomes together so reducing stockouts by ordering unlimited stock cannot look like success:
+
+- **Fill rate:** total fulfilled units / total latent demand; omit or mark undefined when demand is zero.
+- **Stockout product-days:** product-days with unmet demand.
+- **Excess units:** units above the configured capacity or target, with the selected definition reported.
+- **Average on-hand:** mean daily units per product and across the section.
+- **Order overlaps:** distinct orders for the same SKU within the configured delivery window; report these as review signals, since overlapping orders can be legitimate.
+- **Handoff usefulness:** whether pilot writers can identify pending quantities and recent changes without asking their coworker.
+
+Do not report waste reduction without an expiry model, or profit savings without real acquisition costs. Simulated success demonstrates behavior under assumptions, not proven business impact.
+
+Required checks: simultaneous order recording, duplicate request retry, partial receipt followed by cancellation, stale stock count, failed tick replay, cross-store access rejection, units/case conversion, and pending-total reconciliation. The concurrency test must show one winner and one conflict when both requests use the same revision.
+
+## 13. Reliability, cost, and limitations
+
+Keep raw imports immutable, constrain import triggers to the source location, and avoid writing derived files back into the triggering path. Record snapshot/checksum and chunk progress. Failed imports expose a report and resume safely.
+
+Use private buckets, least-privilege roles, TLS, and encryption at rest. Log request/run IDs and sanitized errors rather than full notes or user tokens. Track command conflicts, API failures, stale counts, import errors, reconciliation mismatches, and failed simulation runs. Store simulation state separately from pilot state and disable scheduled simulation when not demonstrating it.
+
+**Budget: $500 AWS sandbox credits; this is a ceiling, not a spending target.** Target an initial $50 pilot allocation, then estimate further work from measured usage. That allocation is not a price quote or an enforced cap. Check credit applicability, expiration, and service restrictions before deployment. Use low concurrency, bounded simulation horizons, modest log retention, and no always-on compute for the MVP. Budget alerts are notifications, not a guaranteed hard spending limit.
+
+The main implementation risk is concurrency correctness and workflow adoption, not sophisticated AI. DynamoDB fits the bounded access patterns, but ad hoc relational reporting would be easier in SQL. Keep that tradeoff explicit rather than adding database complexity just for a portfolio.
+
+## 14. Delivery plan and decisions before implementation
+
+1. Validate the workflow with the user: actual order cadence, how orders are recorded, what a case means, and how receipts/cancellations are communicated.
+2. Inspect the public snapshot, select snack SKUs, and create a versioned synthetic scenario.
+3. Build and test transactional stock/order commands before adding recommendations.
+4. Add the shared inventory screen, drafts, and shift feed; demonstrate the two-writer race.
+5. Add repeatable simulation, compare policies, and report outcomes and limitations.
+6. Refine usability with order writers; consider forecasting or integrations only after the handoff workflow works.
+
+Open decisions: actual store timezone; writer versus lead permissions; case-pack assumptions; review/delivery cadence; capacity and safety-stock settings; which sandbox services are allowed; and whether the pilot needs external-order references.
+
+**Before proceeding:** review this proposed stack and the serverless modular-monolith architecture with event-driven background jobs. Nothing in this document places a real supplier order, provisions AWS resources, or claims access to Trader Joe's internal systems.
