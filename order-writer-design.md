@@ -1,6 +1,6 @@
-# Shared Ordering and Shift Handoff
+# Order Writer Review and Shift Handoff Assistant
 
-**Design document · Draft v2 · November 4, 2026**
+**Design document · Draft v3 · November 4, 2026**
 
 ## 1. Problem and intended users
 
@@ -13,6 +13,30 @@ The primary user is a grocery-section order writer, initially working with snack
 **Product objective:** help a returning writer make informed nightly ordering decisions without opening every item's history. Summarize changes across the entire section since their last worked shift, explain recent demand and ordering patterns, and show how tonight's proposed quantities affect projected stock.
 
 This is an independent portfolio prototype using public product data and synthetic operations. It is not an official Trader Joe's system and has no supplier or point-of-sale integration.
+
+### Evidence and existing workflow
+
+The user's firsthand experience is the primary requirement source for this pilot: orders are written nightly, coworkers can inspect previous case quantities, and reviewing every product after several days away is impractical. The particular shift pattern and interface experience should not be generalized to every Trader Joe's store.
+
+Trader Joe's [official Episode 44 podcast transcript](https://www.traderjoes.com/content/dam/trjo/pdfs/transcripts/InsideTJs-Episode44-Transcript.pdf) describes ordering, merchandising, and product knowledge as section responsibilities. It also discusses kaizen, reducing bureaucracy, and crew empowerment. It does not document the complete internal ordering interface or validate our proposed feature set.
+
+Public, self-reported crew accounts support the hypothesis about review effort:
+
+- A [paper-versus-tablet discussion](https://www.reddit.com/r/tjcrew/comments/1bhjp2g/) describes the benefit of seeing sales averages in cases and several days of order history together, without loading each product page. It also notes that paper information can become outdated.
+- An [ordering-time discussion](https://www.reddit.com/r/tjcrew/comments/1lwix1n/ordering/) describes different approaches, including product-level sales review, case counts, shelf capacity, and experience with a section.
+- A [historical-sales discussion](https://www.reddit.com/r/tjcrew/comments/1qw0boe/super_bowl_weekend/) describes existing tablet history, suggested quantities, and section/date-range reports. These capabilities overlap parts of this proposal and must be investigated before claiming a missing feature.
+
+These accounts span different stores and dates, are not official instructions, and may describe older software. They provide supporting observations, not proof of a universal workflow or a verified integration path.
+
+### Alignment with store values
+
+This tool supports order writers' judgment by reducing the time needed to reconstruct changes across shifts. It brings existing information into an actionable section-wide summary, helping crew make informed decisions while preserving local ownership of ordering.
+
+- **Kaizen:** improve a recurring nightly task in a measurable, incremental way.
+- **No bureaucracy:** shorten the path from a question about a product to the relevant context, without requiring another approval layer.
+- **Crew empowerment and local decisions:** explain calculations, retain writer overrides, and preserve context about local events, displays, and customer demand.
+
+This is a design rationale based on the official transcript, not company endorsement. Do not equate crew empowerment with employee scoring: the product does not rank writers or assign blame for excess stock or shortages.
 
 ## 2. MVP and boundaries
 
@@ -29,6 +53,10 @@ The first version supports:
 Deferred: real supplier submission, live store inventory, automatic purchasing, machine-learning forecasting, expiry/lot tracking, multiple warehouses, and native mobile apps. A simple browser interface is sufficient for the pilot; detailed visual design comes later.
 
 The system cannot prevent a purchase made outside it. Writers must record external orders promptly. Its benefit depends on timely stock and sales inputs; the interface must make stale or missing information visible. The prototype uses simulated sales. A real deployment needs an authorized sales feed or recorded observations; order history alone cannot establish customer demand. When inputs are insufficient, show order/receipt summaries and label demand-based projections unavailable rather than inventing trends.
+
+**First usable milestone:** a read-only ordering review assistant over imported synthetic records, with optional handoff notes and draft quantity previews. It is not a replacement for the existing ordering system. The order/receipt commands below support the simulator and a later operational pilot; they are not prerequisites for testing whether the summary saves time.
+
+Import product-day sales, order lines, receipts, and optional stock observations in one batch rather than requiring writers to retype each product's history. Each record includes source, scope/store, SKU, business date or event time, units, and a stable source record ID; order records additionally include case-pack snapshot and expected arrival. Missing observations remain unknown, never zero by default. Corrections replace a source record by revision and rebuild affected summaries without applying the same stock delta twice. Only synthetic inputs are planned initially; no access to internal reports or exports is assumed.
 
 ## 3. Architecture style
 
@@ -55,7 +83,8 @@ flowchart TD
     SCH[EventBridge Scheduler or manual run] --> SIM[Lambda: simulation worker]
     SIM --> DB
     SIM --> OUT[S3: scenario inputs + experiment results]
-    SIM --> DLQ[SQS: failed scheduled invocations]
+    SCH --> DLQ[SQS: delivery failure queue]
+    SIM --> FAIL[SQS: asynchronous execution failure destination]
 
     L --> LOG[CloudWatch logs + metrics]
     IMP --> LOG
@@ -117,6 +146,8 @@ The worksheet summarizes recent and preceding equal-length periods of observed u
 
 Prioritize products needing attention, while keeping all products searchable. Inline details explain warnings, for example: "Three additional cases would take projected stock above your configured target; four cases are already due tomorrow." Trend summaries and alerts use explicit calculations and templates in the MVP; an LLM is unnecessary.
 
+Suggested quantities, when supplied by an authorized source or simulated for the demo, appear as contextual inputs alongside our calculations. Do not claim to reproduce Trader Joe's existing suggestion logic. Notes can explain displays, holidays, warehouse restrictions, and unusual demand; an unexplained sales change must not be presented as having a known cause.
+
 Per-line order states:
 
 ```text
@@ -176,7 +207,8 @@ S3 retains raw dataset snapshots, validation reports, complete scenario inputs, 
 ## 10. API outline
 
 - `GET /sections/{id}/inventory`: current stock, pending units, count freshness, revisions.
-- `GET /sections/{id}/ordering-summary?since=...`: section-wide trends, recent orders, expected arrivals, notes, proposed-order effects, and calculation/data provenance. Return a computed-through timestamp; authoritative order commands still validate current state.
+- `GET /sections/{id}/ordering-summary?since=...`: section-wide trends, recent orders, expected arrivals, notes, and calculation/data provenance. Return a computed-through timestamp; authoritative order commands still validate current state.
+- `POST /sections/{id}/order-preview`: evaluate proposed cases supplied in the request body against dated stock projections; return explanations and state revisions without creating an order or changing inventory. The summary endpoint supplies existing context; this endpoint handles unsaved quantity edits.
 - `GET /sections/{id}/activity?cursor=...`: paginated shift history.
 - `POST /order-lines`: create a draft.
 - `POST /order-lines/{id}/record-order`: record an external purchase with expected revisions and idempotency key.
@@ -187,6 +219,8 @@ S3 retains raw dataset snapshots, validation reports, complete scenario inputs, 
 - `POST /simulation-runs`: create an isolated, versioned scenario; operator-only.
 
 Authenticate using Cognito; validate tokens at API Gateway and check store/section membership in the backend on every request. A user-provided store ID is not authorization. Scope idempotency records and file access the same way. See [API Gateway JWT authorizers](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html).
+
+For externally placed orders, `cancel-remainder` records a confirmed external cancellation and its reference/reason. A cancellation request alone is a note/status change and does not reduce incoming units. The read-only milestone enables summary, preview, notes, and simulation APIs; operational inventory/order mutation routes remain out of the writer interface until explicitly included in the pilot.
 
 ## 11. Sales and shift simulation
 
@@ -210,7 +244,7 @@ Compare two explicit policies:
 
 Both policies have access to the same underlying information and use the same initial stock, product settings, demand trace, nightly review schedule, and delivery assumptions. Each scenario has separate operational state. Vary the review budget and staleness assumptions, including a full-review baseline where the expected summarization advantage may vanish. The simulation tests modeled decision support; it cannot establish how much time a real writer saves.
 
-Separately test the interaction with writers: provide identical multi-day histories and ask them to identify changed demand, incoming quantities, and items needing review using each interface. Measure completion time and errors, counterbalance interface order, and collect explanations. This directly tests the primary goal of avoiding item-by-item reconstruction.
+Separately test the interaction with writers: provide identical multi-day histories and ask them to identify changed demand, incoming quantities, and items needing review. Compare the prototype with the best existing workflow available, including section-wide reports or paper guides where applicable, as well as the item-detail workflow. Measure completion time and errors, counterbalance interface order, and collect explanations. This directly tests the primary goal of reducing reconstruction effort without assuming existing tools lack summary capabilities.
 
 Evaluate at least 30 seeds over a proposed 60-day horizon, with low/high demand and reliable/delayed delivery scenarios. Report distributions and paired differences, including runs where the tool performs worse.
 
@@ -241,14 +275,23 @@ Use private buckets, least-privilege roles, TLS, and encryption at rest. Log req
 
 The main product risk is whether the summary is accurate, fast, and useful enough to replace manual history review. Data freshness and recording effort matter as much as calculations. DynamoDB fits the bounded access patterns, but ad hoc relational reporting would be easier in SQL. Keep that tradeoff explicit rather than adding database complexity just for a portfolio.
 
+### Outstanding issues to validate
+
+1. **Overlap with existing reports:** compare the prototype with the best existing section-wide workflow available at the user's store, not only a deliberately inconvenient item-by-item interface. If an existing report already solves the task, focus on the remaining handoff context or reconsider the feature.
+2. **Data access and extra work:** the public catalog cannot power actual demand summaries. Test with synthetic batches first. Any future internal-data connection needs an authorized path; copying the same facts into a second app could erase the time savings.
+3. **Freshness and physical stock:** shelf gaps may coexist with backstock, missing deliveries, or incorrect counts. Show provenance, shelf/backstock distinctions when recorded, and uncertainty. Avoid precise coverage claims when stock observations are unreliable.
+4. **Misleading trend comparisons:** different weekday mixes, stockouts, short history, displays, and warehouse restrictions can change observed sales. Show comparison periods and contextual flags; do not automatically label every change a demand trend.
+5. **Alert fatigue:** ordinary nightly replenishment is not an error. Test configurable thresholds and exception priorities, keep the full section accessible, and measure unnecessary warnings as well as missed issues.
+6. **Validation and scope:** an experiment can demonstrate performance under synthetic assumptions, but only writer testing can establish usability. Keep the first milestone centered on review and handoff, with no automated supplier actions or employee performance judgments.
+
 ## 14. Delivery plan and decisions before implementation
 
-1. Validate the workflow with the user: nightly order cadence, blocks of worked shifts, existing access to order history, available sales inputs, what a case means, and how receipts/cancellations are communicated.
+1. Validate the workflow with the user: nightly order cadence, blocks of worked shifts, existing reports and suggested quantities, available sales inputs, what a case means, and how receipts/cancellations are communicated. Compare the best existing workflow before adding another one.
 2. Inspect the public snapshot, select snack SKUs, and create a versioned synthetic scenario.
-3. Build and test transactional stock/order commands before adding recommendations.
-4. Add the section-wide ordering worksheet, drafts, and returning-writer summary; demonstrate a handoff after several days away.
-5. Add repeatable simulation and a timed history-review exercise; compare raw history with summarized context and report outcomes and limitations.
-6. Refine usability with order writers; consider forecasting or integrations only after the handoff workflow works.
+3. Build synthetic batch import and a read-only section summary, optional notes, and draft previews; demonstrate a handoff after several days away.
+4. Build and test transactional stock/order commands for the simulator, then add repeatable experiments and a timed review exercise against the existing workflow. Report outcomes and limitations.
+5. Refine usability with order writers, including warning usefulness and local judgment. Assess whether the time savings justify the data-entry/import effort.
+6. Consider operational mutation routes, forecasting, or authorized integrations only after the handoff workflow works.
 
 Open decisions: actual store timezone; writer versus lead permissions; case-pack assumptions; review/delivery cadence; capacity and safety-stock settings; which sandbox services are allowed; and whether the pilot needs external-order references.
 
